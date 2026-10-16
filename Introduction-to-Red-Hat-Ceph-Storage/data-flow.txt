@@ -1,0 +1,13 @@
+Ceph Data Flow Process:
+1. Client requests data operation
+2. Client calculates object location using CRUSH
+3. Client contacts primary OSD directly
+4. Primary OSD handles replication to secondary OSDs
+5. Primary OSD confirms write completion
+6. Client receives acknowledgment
+
+Benefits:
+- No single point of failure
+- Direct client-to-OSD communication
+- Eliminates metadata bottlenecks
+- Scales horizontally

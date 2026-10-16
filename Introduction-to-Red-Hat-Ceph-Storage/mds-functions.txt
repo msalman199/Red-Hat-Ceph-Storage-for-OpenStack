@@ -1,0 +1,7 @@
+MDS (Metadata Server) Functions:
+1. Manage file system metadata for CephFS
+2. Handle directory operations and file attributes
+3. Provide POSIX-compliant file system interface
+4. Cache metadata for performance
+5. Support multiple active MDS for scalability
+Note: Only required for CephFS, not for RBD or RGW

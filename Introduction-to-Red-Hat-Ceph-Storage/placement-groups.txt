@@ -1,0 +1,7 @@
+Placement Groups (PGs):
+1. Logical grouping of objects for management
+2. Intermediate layer between objects and OSDs
+3. Enable efficient replication and recovery
+4. Reduce metadata overhead
+5. Typical calculation: (OSDs * 100) / replica_count
+6. Must be power of 2 for optimal distribution

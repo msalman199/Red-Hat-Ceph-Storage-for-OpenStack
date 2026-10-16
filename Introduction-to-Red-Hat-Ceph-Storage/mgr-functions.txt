@@ -1,0 +1,7 @@
+MGR (Manager Daemon) Functions:
+1. Collect and provide cluster metrics
+2. Host web-based dashboard interface
+3. Provide REST API for management
+4. Execute management modules and plugins
+5. Handle telemetry and monitoring integration
+6. Support for external monitoring systems

@@ -1,0 +1,7 @@
+OSD (Object Storage Daemon) Functions:
+1. Store data objects on local storage devices
+2. Handle data replication across the cluster
+3. Perform data recovery and backfilling
+4. Execute data scrubbing for consistency
+5. Provide storage capacity metrics
+6. Handle client I/O operations

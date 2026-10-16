@@ -1,0 +1,15 @@
+Ceph Storage Interfaces:
+1. RADOS Block Device (RBD) - Block storage
+   - Virtual disk images
+   - Snapshot and cloning support
+   - Integration with OpenStack, Kubernetes
+
+2. RADOS Gateway (RGW) - Object storage
+   - S3 and Swift API compatibility
+   - Multi-tenancy support
+   - Bucket and object management
+
+3. CephFS - File system
+   - POSIX-compliant distributed file system
+   - Multiple mount points
+   - Snapshot support

@@ -1,0 +1,6 @@
+MON (Monitor Daemon) Functions:
+1. Maintain cluster map (monitor map, OSD map, PG map, CRUSH map)
+2. Provide cluster state information to clients and OSDs
+3. Handle authentication and authorization
+4. Maintain quorum for cluster decisions
+5. Store cluster configuration and metadata

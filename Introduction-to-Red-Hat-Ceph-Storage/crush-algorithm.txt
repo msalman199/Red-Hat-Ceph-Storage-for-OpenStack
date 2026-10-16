@@ -1,0 +1,7 @@
+CRUSH Algorithm Concepts:
+1. Deterministic data placement algorithm
+2. Eliminates need for centralized metadata lookup
+3. Calculates object location based on cluster map
+4. Supports hierarchical storage organization
+5. Enables intelligent data placement policies
+6. Provides failure domain isolation
