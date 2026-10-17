@@ -1,0 +1,355 @@
+Lab 11: Automating Ceph Management with Ansible
+Objectives
+By the end of this lab, students will be able to:
+
+Understand the fundamentals of Ansible automation for Ceph storage clusters
+Write and execute Ansible playbooks for adding OSDs (Object Storage Daemons)
+Automate the creation and configuration of Ceph pools using Ansible
+Manage CRUSH map rules and understand how pools bind to specific CRUSH rules
+Combine pool and CRUSH automation into a single reusable deployment playbook
+Prerequisites
+Before starting this lab, students should have:
+
+Basic understanding of Ceph storage architecture and components (OSDs, monitors, pools, CRUSH)
+Familiarity with Linux command line operations
+Knowledge of YAML syntax and structure
+Understanding of SSH key-based authentication
+Previous experience with Ceph cluster operations (manual deployment preferred)
+This lab assumes an Ansible control node with SSH access to an existing, healthy Ceph cluster (one monitor host in a group called mons, and OSD hosts in a group called osds). All work is performed in an isolated training environment. Install the required Ansible collections on the control node before starting:
+
+ansible --version
+python3 --version
+
+ansible-galaxy collection install community.general
+ansible-galaxy collection install ansible.posix
+Lab Environment Setup
+Ready-to-Use Cloud Machines: Al Nafi provides pre-configured Linux-based cloud machines for this lab. Simply click Start Lab to access your environment. No need to build your own virtual machines or configure complex networking.
+
+Your lab environment includes:
+
+1 Ansible Control Node (Ubuntu 22.04 LTS)
+3 Ceph Nodes (Ubuntu 22.04 LTS) with a pre-deployed, healthy Ceph cluster
+Pre-installed Ansible and required dependencies
+SSH key authentication already configured
+Verify your inventory is in place. If it does not already exist, create it:
+
+mkdir -p ~/ceph-ansible-playbooks
+tee ~/ceph-ansible-playbooks/hosts.yml << 'EOF'
+all:
+  children:
+    mons:
+      hosts:
+        ceph-node1:
+          ansible_host: 10.0.1.10
+    osds:
+      hosts:
+        ceph-node1:
+          ansible_host: 10.0.1.10
+        ceph-node2:
+          ansible_host: 10.0.1.11
+        ceph-node3:
+          ansible_host: 10.0.1.12
+  vars:
+    ansible_user: ubuntu
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+EOF
+
+tee ~/ceph-ansible-playbooks/ansible.cfg << 'EOF'
+[defaults]
+inventory = ./hosts.yml
+remote_user = ubuntu
+host_key_checking = False
+gathering = smart
+
+[ssh_connection]
+pipelining = True
+EOF
+
+cd ~/ceph-ansible-playbooks
+ansible -i hosts.yml all -m ping
+Deliverable: ansible all -m ping returns "ping": "pong" for ceph-node1, ceph-node2, and ceph-node3.
+
+Task 1: Automating OSD Addition
+Step 1.1: Create the OSD Addition Playbook
+tee ~/ceph-ansible-playbooks/add-osd.yml << 'EOF'
+---
+- name: Add a New OSD to the Ceph Cluster
+  hosts: osds
+  become: yes
+  gather_facts: yes
+  vars:
+    osd_disk: "/dev/sdb"
+
+  tasks:
+    - name: Install required packages
+      apt:
+        name:
+          - ceph-osd
+          - ceph-common
+          - gdisk
+          - parted
+        state: present
+        update_cache: yes
+
+    - name: Check whether the target disk already has an OSD prepared
+      shell: |
+        ceph-volume lvm list {{ osd_disk }}
+      register: osd_check
+      changed_when: false
+      failed_when: false
+
+    - name: Prepare and activate the disk as a new OSD
+      shell: |
+        ceph-volume lvm create --data {{ osd_disk }}
+      register: osd_create_result
+      when: "'Devices' not in osd_check.stdout"
+
+    - name: Wait for the new OSD to be reported up
+      shell: |
+        ceph osd tree
+      register: osd_status
+      until: "'up' in osd_status.stdout"
+      retries: 15
+      delay: 10
+      delegate_to: "{{ groups['mons'][0] }}"
+      when: osd_create_result is changed
+
+    - name: Display cluster OSD tree
+      debug:
+        msg: "{{ osd_status.stdout_lines }}"
+      when: osd_status is defined
+EOF
+Step 1.2: Run the Playbook Against a Single Node
+Run this against one OSD host at a time so the disk path applies correctly per host. In this lab environment, /dev/sdb is a pre-attached blank disk on each Ceph node reserved for training.
+
+ansible-playbook add-osd.yml --check --diff --limit ceph-node2
+
+ansible-playbook add-osd.yml --limit ceph-node2 -e "osd_disk=/dev/sdb"
+
+ansible mons[0] -m shell -a "ceph osd tree" -i hosts.yml
+Deliverable: The --check run completes with no errors, the real run reports changed for the ceph-volume lvm create task, and ceph osd tree shows a new osd.N line with status up and in under the host you targeted.
+
+Task 2: Automating Pool Creation and CRUSH Map Management
+Ceph pools and CRUSH rules are tightly linked: every pool is bound to exactly one CRUSH rule, and that rule determines where (which OSDs, hosts, or racks) the pool's data is placed and how many failure domains it spans. A CRUSH rule is cluster-wide configuration â it describes a placement strategy (for example, "replicate across hosts using only SSD-class OSDs") â while a pool is a named container that references one rule via its crush_rule property. Multiple pools can share the same rule, but a single pool can only use one rule at a time.
+
+Use a pool-specific approach (just creating/configuring the pool) when default placement across all hosts is acceptable. Use a CRUSH-level change (new rule, device class, or bucket) when you need to steer placement, for example isolating a pool to SSD-backed OSDs only. The relationship looks like this:
+
+CRUSH Map                          Pools
+-----------                        -----------------
+rule "replicated_rule" (default) <--- pool "rbd"
+rule "ssd_rule" (host, class=ssd) <--- pool "fast-data"
+rule "hdd_rule"  (host, class=hdd) <--- pool "bulk-archive"
+In this task you will first create a CRUSH rule, then create a pool that explicitly uses it, demonstrating the full chain from CRUSH rule to pool assignment.
+
+Step 2.1: Create the CRUSH Map Management Playbook
+tee ~/ceph-ansible-playbooks/manage-crush-map.yml << 'EOF'
+---
+- name: Manage Ceph CRUSH Map Rules
+  hosts: mons[0]
+  become: yes
+  gather_facts: yes
+  vars:
+    crush_backup_dir: /tmp/crush-backups
+    rule_name: "ssd_rule"
+    failure_domain: "host"
+
+  tasks:
+    - name: Create backup directory
+      file:
+        path: "{{ crush_backup_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Backup current CRUSH map (binary and JSON)
+      shell: |
+        ceph osd getcrushmap -o {{ crush_backup_dir }}/crushmap-{{ ansible_date_time.epoch }}.bin
+        ceph osd crush dump > {{ crush_backup_dir }}/crushmap-{{ ansible_date_time.epoch }}.json
+
+    - name: List existing CRUSH rules
+      shell: ceph osd crush rule ls
+      register: existing_rules
+      changed_when: false
+
+    - name: Create a replicated CRUSH rule scoped to a device class
+      shell: |
+        ceph osd crush rule create-replicated {{ rule_name }} default {{ failure_domain }} {{ device_class | default('ssd') }}
+      when: rule_name not in existing_rules.stdout
+
+    - name: Verify the new rule exists
+      shell: ceph osd crush rule ls
+      register: updated_rules
+      changed_when: false
+
+    - name: Display current CRUSH rules
+      debug:
+        msg: "{{ updated_rules.stdout_lines }}"
+
+    - name: Show the rule's full definition
+      shell: ceph osd crush rule dump {{ rule_name }}
+      register: rule_dump
+      changed_when: false
+
+    - name: Display rule definition
+      debug:
+        msg: "{{ rule_dump.stdout }}"
+EOF
+Step 2.2: Create the Pool Management Playbook
+tee ~/ceph-ansible-playbooks/manage-pools.yml << 'EOF'
+---
+- name: Manage Ceph Pools
+  hosts: mons[0]
+  become: yes
+  gather_facts: no
+  vars:
+    pool_name: "fast-data"
+    pg_num: 32
+    pgp_num: 32
+    pool_size: 3
+    pool_min_size: 2
+    crush_rule: "ssd_rule"
+    pool_application: "rbd"
+
+  tasks:
+    - name: Check current cluster health
+      shell: ceph -s --format json
+      register: cluster_status
+      changed_when: false
+
+    - name: Parse cluster health status
+      set_fact:
+        cluster_health: "{{ (cluster_status.stdout | from_json).health.status }}"
+
+    - name: Fail if cluster is not healthy
+      fail:
+        msg: "Cluster health is {{ cluster_health }}. Resolve before creating pools."
+      when:
+        - cluster_health != "HEALTH_OK"
+        - force_create | default(false) == false
+
+    - name: Check if pool already exists
+      shell: ceph osd pool ls | grep -x "{{ pool_name }}"
+      register: pool_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Create the pool
+      shell: |
+        ceph osd pool create {{ pool_name }} {{ pg_num }} {{ pgp_num }} replicated
+      when: pool_exists.rc != 0
+
+    - name: Assign the pool to a specific CRUSH rule
+      shell: |
+        ceph osd pool set {{ pool_name }} crush_rule {{ crush_rule }}
+      register: rule_assignment
+      failed_when:
+        - rule_assignment.rc != 0
+        - "'does not exist' in rule_assignment.stderr"
+
+    - name: Set pool replication size
+      shell: ceph osd pool set {{ pool_name }} size {{ pool_size }}
+
+    - name: Set pool min_size
+      shell: ceph osd pool set {{ pool_name }} min_size {{ pool_min_size }}
+
+    - name: Enable application on the pool
+      shell: ceph osd pool application enable {{ pool_name }} {{ pool_application }}
+      register: app_enable
+      failed_when:
+        - app_enable.rc != 0
+        - "'already enabled' not in app_enable.stderr"
+
+    - name: Retrieve final pool configuration
+      shell: ceph osd pool get {{ pool_name }} crush_rule
+      register: final_rule
+      changed_when: false
+
+    - name: Display assigned CRUSH rule for the pool
+      debug:
+        msg: "Pool {{ pool_name }} is using CRUSH rule: {{ final_rule.stdout }}"
+EOF
+Step 2.3: Combine Both Playbooks into a Single Deployment
+Create an orchestrating playbook that runs the CRUSH rule setup first, then creates the pool bound to that rule, proving the dependency order matters.
+
+tee ~/ceph-ansible-playbooks/deploy-storage-solution.yml << 'EOF'
+---
+- name: Deploy Complete Storage Solution (CRUSH Rule + Pool)
+  hosts: mons[0]
+  become: yes
+  gather_facts: yes
+  vars:
+    rule_name: "ssd_rule"
+    device_class: "ssd"
+    failure_domain: "host"
+    pool_name: "fast-data"
+    pg_num: 32
+    pgp_num: 32
+    pool_size: 3
+    pool_min_size: 2
+    pool_application: "rbd"
+
+  tasks:
+    - name: Include CRUSH map management tasks
+      import_playbook: manage-crush-map.yml
+      vars:
+        rule_name: "{{ rule_name }}"
+        device_class: "{{ device_class }}"
+        failure_domain: "{{ failure_domain }}"
+
+    - name: Include pool management tasks
+      import_playbook: manage-pools.yml
+      vars:
+        pool_name: "{{ pool_name }}"
+        pg_num: "{{ pg_num }}"
+        pgp_num: "{{ pgp_num }}"
+        pool_size: "{{ pool_size }}"
+        pool_min_size: "{{ pool_min_size }}"
+        crush_rule: "{{ rule_name }}"
+        pool_application: "{{ pool_application }}"
+EOF
+Note: import_playbook can only be used at the top level of a playbook file, not nested inside a tasks: list. Replace the file above with the corrected top-level structure below, which is the version you will actually execute:
+
+tee ~/ceph-ansible-playbooks/deploy-storage-solution.yml << 'EOF'
+---
+- import_playbook: manage-crush-map.yml
+  vars:
+    rule_name: "ssd_rule"
+    device_class: "ssd"
+    failure_domain: "host"
+
+- import_playbook: manage-pools.yml
+  vars:
+    pool_name: "fast-data"
+    pg_num: 32
+    pgp_num: 32
+    pool_size: 3
+    pool_min_size: 2
+    crush_rule: "ssd_rule"
+    pool_application: "rbd"
+EOF
+Step 2.4: Run and Verify the Combined Playbook
+ansible-playbook deploy-storage-solution.yml --syntax-check
+
+ansible-playbook deploy-storage-solution.yml
+
+ansible mons[0] -i hosts.yml -m shell -a "ceph osd pool get fast-data crush_rule"
+ansible mons[0] -i hosts.yml -m shell -a "ceph osd crush rule dump ssd_rule"
+Deliverable: ceph osd pool get fast-data crush_rule outputs crush_rule: ssd_rule, and ceph osd crush rule dump ssd_rule shows a rule definition whose steps include "item_name": "default~ssd" or an equivalent device-class-scoped step, confirming the pool is bound to the rule you created.
+
+Usage example for reuse with different names:
+
+ansible-playbook deploy-storage-solution.yml \
+  -e "rule_name=hdd_rule device_class=hdd pool_name=bulk-archive pg_num=16 pgp_num=16"
+Expected Outcomes
+A working add-osd.yml playbook that safely prepares and activates a new OSD on a target host
+A CRUSH rule (ssd_rule) created and verified via ceph osd crush rule dump
+A pool (fast-data) created, explicitly bound to that CRUSH rule, sized, and enabled for an application
+A single orchestrating playbook (deploy-storage-solution.yml) that reproduces both results in one run
+Troubleshooting
+Symptom: ceph-volume lvm create fails with "Device is not available" or similar. Diagnostic hint: Run ceph-volume lvm list and lsblk on the target host to confirm the disk path is correct and has no existing partition table or LVM signature from a prior test.
+
+Symptom: ceph osd pool set fast-data crush_rule ssd_rule fails with an error about the rule not existing or having an incompatible bucket type. Diagnostic hint: Run ceph osd crush rule ls and ceph osd tree to confirm the rule was actually created and that OSDs in your cluster have the expected device class assigned (ceph osd crush class ls).
+
+Conclusion
+In this lab, students automated core Ceph cluster operations using Ansible, moving from manual command-line administration to repeatable, version-controlled playbooks. Students built and executed a playbook to add a new OSD safely, then explored the relationship between CRUSH rules and pools by creating a device-class-scoped CRUSH rule and binding a new pool to it explicitly, verifying the linkage with ceph osd pool get and ceph osd crush rule dump. Finally, students combined both playbooks into a single orchestrated deployment, demonstrating how independent Ansible playbooks can be composed into larger, reusable automation workflows.
+
+Key skills gained include writing idempotent Ansible tasks against a live Ceph cluster, safely gating destructive or state-changing operations behind health checks, and understanding how CRUSH rules and pools interact to control data placement. Students who want to extend this work further should explore automating erasure-coded pool creation, multi-rule CRUSH hierarchies spanning racks or datacenters, and integrating these playbooks with cephadm or the official ceph-ansible roles for full lifecycle management in production-like environments.
