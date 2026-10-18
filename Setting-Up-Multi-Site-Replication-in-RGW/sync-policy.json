@@ -1,0 +1,22 @@
+{
+  "sync_policy_id": "default-policy",
+  "groups": [
+    {
+      "id": "default-group",
+      "data_flow": {
+        "symmetrical": false
+      },
+      "pipes": [
+        {
+          "id": "default-pipe",
+          "source": {
+            "zones": ["us-east"]
+          },
+          "dest": {
+            "zones": ["us-west"]
+          }
+        }
+      ]
+    }
+  ]
+}
