@@ -1,0 +1,10 @@
+2026-10-18 03:14:17 - Starting recovery validation
+2026-10-18 03:14:17 - Checking cluster health
+2026-10-18 03:14:17 - Cluster health: 
+2026-10-18 03:14:17 - Checking monitor status
+2026-10-18 03:14:17 - Checking OSD status
+2026-10-18 03:14:17 - Checking pool status
+2026-10-18 03:14:17 - Testing data operations
+2026-10-18 03:14:17 - ERROR: Data operations failed
+2026-10-18 03:14:17 - Recovery validation completed
+2026-10-18 03:14:17 - Check log file for detailed results: /opt/ceph-recovery/logs/validation-2026-10-18_03-14-17.log

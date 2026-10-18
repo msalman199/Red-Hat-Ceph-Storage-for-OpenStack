@@ -1,0 +1,1 @@
+/opt/ceph-backups/ceph-backup.sh: line 30: ceph: command not found

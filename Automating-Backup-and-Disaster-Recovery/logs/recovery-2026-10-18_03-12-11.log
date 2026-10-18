@@ -1,0 +1,17 @@
+2026-10-18 03:12:11 - Starting disaster recovery from backup: /opt/ceph-backups/daily/ceph-backup-2026-10-18_03-11-24.tar.gz
+2026-10-18 03:12:11 - Extracting backup file
+2026-10-18 03:12:11 - Found backup directory: ./2026-10-18_03-11-24
+2026-10-18 03:12:11 - Stopping Ceph services
+2026-10-18 03:12:11 - Restoring Ceph configuration
+2026-10-18 03:12:11 - Restoring CRUSH map
+2026-10-18 03:12:11 - Recovery information available:
+2026-10-18 03:12:11 - - Monitor dump: ./2026-10-18_03-11-24/mon-dump.txt
+2026-10-18 03:12:11 - - OSD dump: ./2026-10-18_03-11-24/osd-dump.txt
+2026-10-18 03:12:11 - - Configuration: ./2026-10-18_03-11-24/config-dump.txt
+2026-10-18 03:12:11 - - Health report: ./2026-10-18_03-11-24/health-detail.txt
+2026-10-18 03:12:11 - Manual steps required:
+2026-10-18 03:12:11 - 1. Review cluster maps in backup directory
+2026-10-18 03:12:11 - 2. Recreate OSDs if necessary
+2026-10-18 03:12:11 - 3. Restart Ceph services
+2026-10-18 03:12:11 - 4. Verify cluster health
+2026-10-18 03:12:11 - Disaster recovery preparation completed
