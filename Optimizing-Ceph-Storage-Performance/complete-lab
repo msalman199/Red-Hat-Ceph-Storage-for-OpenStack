@@ -1,0 +1,456 @@
+Lab 20: Optimizing Ceph Storage Performance
+Objectives
+By the end of this lab, students will be able to:
+
+Analyze and optimize Ceph cluster performance through CRUSH map tuning
+Configure OSD parameters for improved storage performance
+Measure and optimize network throughput and latency in Ceph clusters
+Identify and implement strategies to reduce storage hotspots
+Use performance monitoring tools to establish baselines and validate improvements against real, measured data
+Prerequisites
+Before starting this lab, students should have:
+
+Basic understanding of Ceph architecture (OSDs, MONs, MGRs)
+Familiarity with Linux command line operations
+Knowledge of storage concepts (IOPS, throughput, latency)
+Understanding of network fundamentals
+Experience with basic Ceph administration commands
+Completion of previous Ceph labs or equivalent knowledge
+Required tools used in this lab (already installed on the provided lab machines; install commands are given in case you need to repeat this on your own cluster):
+
+# RADOS bench and crushtool ship with ceph-common
+sudo apt-get install -y ceph-common bc python3
+
+# iperf3 for network throughput testing
+sudo apt-get install -y iperf3
+# or on RHEL/CentOS-based nodes:
+sudo yum install -y iperf3 ceph-common bc python3
+Lab Environment
+Ready-to-Use Cloud Machines: Al Nafi provides pre-configured Linux-based cloud machines with a Ceph cluster already deployed. Simply click Start Lab to access your environment - no need to build your own VM or install Ceph from scratch.
+
+Your lab environment includes:
+
+3 Ceph Monitor nodes (ceph-mon-01, ceph-mon-02, ceph-mon-03)
+6 Ceph OSD nodes (ceph-osd-01 through ceph-osd-06)
+1 Ceph Manager node (ceph-mgr-01)
+1 Client node for testing (ceph-client-01)
+Task 0: Establish a Performance Baseline
+Before changing anything, you must capture the cluster's current state. Every optimization claim later in this lab is only meaningful if compared against a baseline you actually measured.
+
+Subtask 0.1: Build and Run the Hotspot Monitor Script
+Connect to the first monitor node:
+ssh ceph-mon-01
+Create the hotspot monitoring dashboard script. This script reports cluster health, OSD utilization variance, utilization extremes, PG distribution, and slow-operation counts.
+cat > ~/hotspot-monitor.sh << 'EOF'
+#!/bin/bash
+
+echo "Ceph Hotspot Monitoring Dashboard"
+echo "================================="
+echo "Timestamp: $(date)"
+echo ""
+
+# Cluster health overview
+echo "1. Cluster Health:"
+echo "-----------------"
+sudo ceph health
+echo ""
+
+# OSD utilization variance
+echo "2. OSD Utilization Variance:"
+echo "---------------------------"
+sudo ceph osd df | awk 'NR>1 && $8 ~ /^[0-9.]+$/ {
+    util[count] = $8
+    total += $8
+    count++
+}
+END {
+    if (count == 0) { print "No OSD utilization data available"; exit }
+    avg = total/count
+    variance = 0
+    for (i=0; i<count; i++) {
+        variance += (util[i] - avg)^2
+    }
+    variance = variance/count
+    stddev = sqrt(variance)
+    cv = (avg > 0) ? stddev/avg * 100 : 0
+
+    print "Average utilization: " avg
+    print "Standard deviation: " stddev
+    print "Coefficient of variation: " cv "%"
+    if (cv < 10) print "Status: GOOD - Low variance"
+    else if (cv < 20) print "Status: MODERATE - Some imbalance"
+    else print "Status: HIGH - Significant hotspots"
+}'
+echo ""
+
+# Top and bottom OSDs by utilization
+echo "3. OSD Utilization Extremes:"
+echo "---------------------------"
+echo "Highest utilized OSDs:"
+sudo ceph osd df | awk 'NR>1 {print $1, $8}' | sort -k2 -nr | head -3 | awk '{print "  OSD." $1 ": " $2 "x average"}'
+echo "Lowest utilized OSDs:"
+sudo ceph osd df | awk 'NR>1 {print $1, $8}' | sort -k2 -n | head -3 | awk '{print "  OSD." $1 ": " $2 "x average"}'
+echo ""
+
+# PG distribution analysis
+echo "4. PG Distribution Analysis:"
+echo "---------------------------"
+sudo ceph pg dump osds 2>/dev/null | awk 'NR>1 && $2 ~ /^[0-9]+$/ {print $2}' | sort -n | awk '
+{
+    pgs[NR] = $1
+    total += $1
+    count++
+}
+END {
+    if (count == 0) { print "No PG data available"; exit }
+    avg = total/count
+    min = pgs[1]
+    max = pgs[count]
+    range = max - min
+
+    print "Average PGs per OSD: " avg
+    print "Min PGs: " min ", Max PGs: " max
+    print "Range: " range " (" int(range/avg*100) "% of average)"
+
+    if (range/avg < 0.1) print "PG Distribution: EXCELLENT"
+    else if (range/avg < 0.2) print "PG Distribution: GOOD"
+    else if (range/avg < 0.3) print "PG Distribution: MODERATE"
+    else print "PG Distribution: NEEDS IMPROVEMENT"
+}'
+echo ""
+
+# Recent slow operations
+echo "5. Performance Issues:"
+echo "---------------------"
+slow_ops=$(sudo ceph health detail | grep -c "slow")
+if [ "$slow_ops" -gt 0 ]; then
+    echo "WARNING: $slow_ops slow operation warnings detected"
+    sudo ceph health detail | grep slow | head -5
+else
+    echo "No slow operations detected"
+fi
+EOF
+
+chmod +x ~/hotspot-monitor.sh
+Run the script and save its output as your baseline. This baseline file is the reference you will compare against at the end of the lab.
+./hotspot-monitor.sh | tee ~/baseline-metrics.txt
+Deliverable: A file ~/baseline-metrics.txt containing real, current cluster metrics (coefficient of variation, PG distribution, slow-op count). Confirm it is non-empty with cat ~/baseline-metrics.txt â�� you should see actual numbers pulled from your cluster, not placeholder text.
+
+Task 1: Tune CRUSH Map and OSD Parameters for Performance
+Subtask 1.1: Analyze Current CRUSH Map Configuration
+Check overall cluster health and status:
+sudo ceph health detail
+sudo ceph -s
+Examine the current CRUSH map:
+sudo ceph osd getcrushmap -o crushmap.bin
+sudo crushtool -d crushmap.bin -o crushmap.txt
+cat crushmap.txt
+Analyze CRUSH rule configuration:
+sudo ceph osd crush rule ls
+sudo ceph osd crush rule dump replicated_rule
+Deliverable: A saved crushmap.txt file and command output showing the existing rule set (rule name, min_size, max_size, and steps). You should be able to state, in one sentence, which failure domain (host, chassis, rack, etc.) the default rule uses.
+
+Subtask 1.2: Optimize CRUSH Map and OSD Parameters
+Back up the current CRUSH map before making any changes:
+mkdir -p ~/ceph-backups
+sudo ceph osd getcrushmap -o ~/ceph-backups/crushmap-original.bin
+Create a performance-optimized CRUSH rule that targets hdd-class devices explicitly (useful when you want to separate bulk HDD traffic from a future SSD pool):
+sudo ceph osd crush rule create-replicated performance_rule default host hdd
+
+sudo ceph osd crush rule ls
+sudo ceph osd crush rule dump performance_rule
+Tune OSD operation queue and thread settings to improve I/O scheduling fairness and parallelism:
+# Check current values first
+sudo ceph config get osd osd_op_queue
+sudo ceph config get osd osd_max_backfills
+sudo ceph config get osd osd_recovery_max_active
+
+# Apply performance-oriented settings
+sudo ceph config set osd osd_op_queue wpq
+sudo ceph config set osd osd_op_queue_cut_off high
+sudo ceph config set osd osd_op_num_threads_per_shard 2
+sudo ceph config set osd osd_op_num_shards 8
+Tune recovery/backfill throttling so background rebalancing does not starve client I/O:
+sudo ceph config set osd osd_recovery_max_active 3
+sudo ceph config set osd osd_max_backfills 1
+sudo ceph config set osd osd_recovery_sleep 0.1
+sudo ceph config set osd osd_recovery_sleep_hdd 0.1
+Tune BlueStore cache and allocation size based on the media type:
+sudo ceph config set osd bluestore_cache_size_hdd 1073741824   # 1GB for HDD
+sudo ceph config set osd bluestore_cache_size_ssd 3221225472   # 3GB for SSD
+sudo ceph config set osd bluestore_min_alloc_size_hdd 65536    # 64KB for HDD
+sudo ceph config set osd bluestore_min_alloc_size_ssd 16384    # 16KB for SSD
+Verify the settings were applied:
+sudo ceph config dump | grep -E "osd_op_queue|osd_max_backfills|osd_recovery_max_active|bluestore_cache_size|bluestore_min_alloc_size"
+Deliverable: Command output confirming every parameter set in steps 3-5 now shows the new value in ceph config dump. If any value does not match what you set, re-run the corresponding ceph config set command and re-verify.
+
+Subtask 1.3: Monitor Cluster Impact of the Changes
+sudo ceph -s
+sudo ceph pg stat
+sudo ceph health detail
+Deliverable: Cluster health should return to HEALTH_OK (or remain there) within a few minutes of applying these settings, with no new stuck or inactive PGs. If PGs are peering or activating, wait and re-check with sudo ceph -s until the counts stabilize.
+
+Task 2: Analyze and Optimize Network Throughput and Latency
+Subtask 2.1: Measure Current Network Performance
+Check network interface configuration on key nodes:
+for node in ceph-mon-01 ceph-osd-01 ceph-osd-02 ceph-osd-03; do
+    echo "=== $node ==="
+    ssh $node "ip addr show | grep -E 'inet '"
+    ssh $node "ethtool eth0 2>/dev/null | grep Speed"
+done
+Test latency between nodes:
+cat > ~/test-latency.sh << 'EOF'
+#!/bin/bash
+
+nodes=("ceph-mon-01" "ceph-osd-01" "ceph-osd-02" "ceph-osd-03" "ceph-mgr-01")
+
+echo "Network Latency Test Results:"
+echo "============================="
+
+for source in "${nodes[@]}"; do
+    for target in "${nodes[@]}"; do
+        if [ "$source" != "$target" ]; then
+            echo -n "$source -> $target: "
+            ssh "$source" "ping -c 3 -q $target 2>/dev/null | tail -1 | awk -F'/' '{print \$5\" ms avg\"}'" || echo "Failed"
+        fi
+    done
+done
+EOF
+
+chmod +x ~/test-latency.sh
+./test-latency.sh | tee ~/baseline-latency.txt
+Test throughput with iperf3:
+# Start server on one OSD node
+ssh ceph-osd-01 "iperf3 -s -D"
+
+echo "Network Throughput Test Results:" | tee ~/baseline-throughput.txt
+echo "===============================" | tee -a ~/baseline-throughput.txt
+for node in ceph-osd-02 ceph-osd-03 ceph-mgr-01; do
+    echo "Testing $node -> ceph-osd-01:" | tee -a ~/baseline-throughput.txt
+    ssh $node "iperf3 -c ceph-osd-01 -t 10 -P 4" | tee -a ~/baseline-throughput.txt
+    echo "" | tee -a ~/baseline-throughput.txt
+done
+Deliverable: Two files, ~/baseline-latency.txt and ~/baseline-throughput.txt, containing real measured round-trip times (ms) and bandwidth figures (Gbits/sec) between your cluster nodes. Note the average latency and average bandwidth â�� you will compare against these later.
+
+Subtask 2.2: Apply Network and Messenger Optimizations
+Apply kernel-level network buffer tuning on the monitor and OSD nodes:
+cat > ~/optimize-network.sh << 'EOF'
+#!/bin/bash
+
+echo "Applying network optimizations..."
+
+sudo tee -a /etc/sysctl.conf > /dev/null << SYSCTL
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.core.rmem_default = 65536
+net.core.wmem_default = 65536
+net.ipv4.tcp_rmem = 4096 65536 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+net.netfilter.nf_conntrack_max = 1048576
+SYSCTL
+
+sudo sysctl -p
+
+echo "Network optimization complete"
+EOF
+
+chmod +x ~/optimize-network.sh
+
+for node in ceph-mon-01 ceph-osd-01 ceph-osd-02 ceph-osd-03; do
+    echo "Optimizing network on $node"
+    scp ~/optimize-network.sh $node:~/
+    ssh $node "bash ~/optimize-network.sh"
+done
+Apply Ceph messenger-level tuning:
+sudo ceph config set global ms_tcp_nodelay true
+sudo ceph config set global ms_tcp_rcvbuf 65536
+sudo ceph config set global ms_cluster_mode crc
+sudo ceph config set global ms_service_mode crc
+Re-run the latency and throughput tests and compare:
+./test-latency.sh | tee ~/after-latency.txt
+diff ~/baseline-latency.txt ~/after-latency.txt || true
+Deliverable: A diff output between baseline-latency.txt and after-latency.txt. Record whether average latency values decreased, stayed flat, or increased. In a lab environment with lightly loaded virtual networking, it is normal and acceptable to see little or no measurable change â�� the important outcome is that you can produce and read a real before/after comparison, not that a specific improvement threshold is hit.
+
+Task 3: Identify and Mitigate Storage Hotspots
+Subtask 3.1: Detect Hotspots
+Review OSD utilization and PG distribution:
+sudo ceph osd df
+sudo ceph osd perf
+sudo ceph pg dump osds | awk 'NR>1 {print $1, $2}' | sort -k2 -n
+Create and run a dedicated hotspot detection script:
+cat > ~/detect-hotspots.sh << 'EOF'
+#!/bin/bash
+
+echo "Ceph Storage Hotspot Analysis"
+echo "============================"
+echo "Timestamp: $(date)"
+echo ""
+
+echo "OSD Utilization Analysis:"
+echo "------------------------"
+sudo ceph osd df | awk 'NR>1 && $8 ~ /^[0-9.]+$/ {
+    if ($8 > 1.2) print "HOT: OSD." $1 " - Usage: " $8 "x average"
+    else if ($8 < 0.8) print "COLD: OSD." $1 " - Usage: " $8 "x average"
+}'
+echo ""
+
+echo "PG Distribution Analysis:"
+echo "------------------------"
+sudo ceph osd df | awk 'NR>1 {print $1, $2}' | sort -k2 -n | awk '
+{total+=$2; count++; osds[count]=$1; pgs[count]=$2}
+END {
+    if (count == 0) { print "No data"; exit }
+    avg=total/count
+    print "Average PGs per OSD: " avg
+    print "Hotspot OSDs (>120% of average):"
+    for(i=1; i<=count; i++) {
+        if(pgs[i] > avg*1.2) print "  OSD." osds[i] ": " pgs[i] " PGs (" int(pgs[i]/avg*100) "% of average)"
+    }
+}'
+echo ""
+
+echo "Slow Request Analysis:"
+echo "---------------------"
+sudo ceph health detail | grep -i slow || echo "No slow requests detected"
+EOF
+
+chmod +x ~/detect-hotspots.sh
+./detect-hotspots.sh
+Deliverable: Console output listing any OSDs flagged HOT or COLD, and the count of pools/PGs that exceed 120 percent of the average. If no hotspots exist yet (likely on a freshly deployed lab cluster), note that explicitly â�� this is expected on a small, evenly-provisioned cluster.
+
+Subtask 3.2: Mitigate Hotspots
+Reweight OSDs based on utilization:
+cat > ~/reweight-osds.sh << 'EOF'
+#!/bin/bash
+
+echo "OSD Reweighting for Hotspot Mitigation"
+echo "======================================"
+
+sudo ceph osd df | awk 'NR>1 && $8 ~ /^[0-9.]+$/ {
+    osd=$1; weight=$3; util=$8
+    if (util > 1.3) {
+        new_weight = weight * 0.9
+        print "sudo ceph osd reweight osd." osd " " new_weight " # Current util: " util
+    } else if (util < 0.7) {
+        new_weight = weight * 1.1
+        if (new_weight > 1.0) new_weight = 1.0
+        print "sudo ceph osd reweight osd." osd " " new_weight " # Current util: " util
+    }
+}' > /tmp/reweight_commands.sh
+
+echo "Suggested reweighting commands:"
+cat /tmp/reweight_commands.sh
+
+if [ -s /tmp/reweight_commands.sh ]; then
+    read -p "Apply these reweighting changes? (y/N): " confirm
+    if [[ $confirm == [yY] ]]; then
+        bash /tmp/reweight_commands.sh
+        echo "Reweighting applied. Current status:"
+        sudo ceph -s
+    else
+        echo "Reweighting cancelled."
+    fi
+else
+    echo "No OSDs exceed the reweighting thresholds. No action needed."
+fi
+EOF
+
+chmod +x ~/reweight-osds.sh
+./reweight-osds.sh
+Check and optimize CRUSH tunables:
+sudo ceph osd crush show-tunables
+
+read -p "Apply optimal CRUSH tunables? (y/N): " confirm
+if [[ $confirm == [yY] ]]; then
+    sudo ceph osd crush tunables optimal
+    echo "Optimal tunables applied. This may trigger data movement."
+    sudo ceph -s
+fi
+Deliverable: Either a log of reweight commands actually executed (with before/after ceph osd df showing utilization moving closer to the average), or, if no OSD needed reweighting, a one-line note in your own words confirming the cluster was already balanced.
+
+Subtask 3.3: Validate Against the Baseline
+Now compare your cluster's current state directly against the baseline captured in Task 0.
+
+Re-run the hotspot monitor:
+./hotspot-monitor.sh | tee ~/after-metrics.txt
+Diff against the baseline you saved before making any changes:
+diff ~/baseline-metrics.txt ~/after-metrics.txt || true
+Create a comparison script that reads both real files rather than hardcoded numbers:
+cat > ~/performance-comparison.sh << 'EOF'
+#!/bin/bash
+
+BASELINE=~/baseline-metrics.txt
+CURRENT=~/after-metrics.txt
+
+if [ ! -f "$BASELINE" ]; then
+    echo "ERROR: Baseline file $BASELINE not found."
+    echo "Run Task 0 (./hotspot-monitor.sh | tee ~/baseline-metrics.txt) before comparing."
+    exit 1
+fi
+
+if [ ! -f "$CURRENT" ]; then
+    echo "Generating current metrics snapshot..."
+    ./hotspot-monitor.sh | tee "$CURRENT"
+fi
+
+echo "Performance Optimization Results"
+echo "==============================="
+echo ""
+echo "Baseline metrics (captured before optimization):"
+echo "-------------------------------------------------"
+grep -E "Coefficient of variation|Average PGs per OSD|WARNING|No slow operations" "$BASELINE"
+echo ""
+echo "Current metrics (after optimization):"
+echo "--------------------------------------"
+grep -E "Coefficient of variation|Average PGs per OSD|WARNING|No slow operations" "$CURRENT"
+echo ""
+echo "Full diff:"
+echo "----------"
+diff "$BASELINE" "$CURRENT" || echo "(no textual differences detected)"
+EOF
+
+chmod +x ~/performance-comparison.sh
+./performance-comparison.sh
+Deliverable: Output of performance-comparison.sh showing the baseline coefficient of variation, PG distribution status, and slow-op count side by side with the current values, plus the full diff. Every number in this report must trace back to a file your commands actually generated â�� there should be no hardcoded "before" values anywhere in this script.
+
+Task 4: Validate Performance with RADOS Bench
+Subtask 4.1: Run Benchmark Tests
+cat > ~/performance-test.sh << 'EOF'
+#!/bin/bash
+
+echo "Ceph Performance Validation Test"
+echo "==============================="
+
+sudo ceph osd pool create benchmark 128 128
+sudo ceph osd pool application enable benchmark rbd
+
+echo "1. Sequential Write Test (10 seconds):"
+sudo rados bench -p benchmark 10 write --no-cleanup | grep -E "bandwidth|Average Latency"
+echo ""
+
+echo "2. Sequential Read Test (10 seconds):"
+sudo rados bench -p benchmark 10 seq | grep -E "bandwidth|Average Latency"
+echo ""
+
+echo "3. Random Read Test (10 seconds):"
+sudo rados bench -p benchmark 10 rand | grep -E "bandwidth|Average Latency"
+echo ""
+
+echo "Cleaning up test objects..."
+sudo rados -p benchmark cleanup
+
+sudo ceph osd pool delete benchmark benchmark --yes-i-really-really-mean-it
+
+echo "Performance test completed."
+EOF
+
+chmod +x ~/performance-test.sh
+./performance-test.sh | tee ~/rados-bench-results.txt
+Deliverable: ~/rados-bench-results.txt containing actual measured bandwidth (MB/s) and average latency (seconds) for write, sequential read, and random read tests. Identify which operation type had the highest and lowest bandwidth in your results.
+
+Expected Outcomes
+A documented, measured baseline (baseline-metrics.txt, baseline-latency.txt, baseline-throughput.txt) captured before any tuning was applied
+CRUSH map and OSD parameters tuned for improved I/O scheduling, recovery throttling, and cache usage, verified through ceph config dump
+A final, evidence-based comparison (performance-comparison.sh output and RADOS bench results) showing real before/after cluster metrics rather than assumed values
+Conclusion
+In this lab, you worked through a complete performance optimization cycle on a live Ceph cluster: capturing a real baseline, tuning CRUSH placement rules and OSD parameters, adjusting network and messenger settings, detecting and mitigating storage hotspots, and validating every change against the data you actually measured rather than assumed figures. You built reusable diagnostic tooling â�� hotspot-monitor.sh, detect-hotspots.sh, reweight-osds.sh, and performance-comparison.sh â�� that reads live cluster state on every run, so the before/after comparisons you produced reflect genuine cluster behavior. By the end of the lab you should be able to explain, with your own measured numbers, whether your optimizations reduced utilization variance, improved PG balance, or changed network latency and RADOS bench throughput, and you should be comfortable applying this same measure-tune-validate workflow to a production Ceph cluster.

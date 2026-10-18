@@ -1,0 +1,10 @@
+Ceph Performance Validation Test
+===============================
+1. Sequential Write Test (10 seconds):
+
+2. Sequential Read Test (10 seconds):
+
+3. Random Read Test (10 seconds):
+
+Cleaning up test objects...
+Performance test completed.

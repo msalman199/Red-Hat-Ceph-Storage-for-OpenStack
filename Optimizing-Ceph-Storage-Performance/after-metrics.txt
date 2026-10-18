@@ -1,0 +1,23 @@
+Ceph Hotspot Monitoring Dashboard
+=================================
+Timestamp: Sun Oct 18 04:06:37 UTC 2026
+
+1. Cluster Health:
+-----------------
+
+2. OSD Utilization Variance:
+---------------------------
+No OSD utilization data available
+
+3. OSD Utilization Extremes:
+---------------------------
+Highest utilized OSDs:
+Lowest utilized OSDs:
+
+4. PG Distribution Analysis:
+---------------------------
+No PG data available
+
+5. Performance Issues:
+---------------------
+No slow operations detected
