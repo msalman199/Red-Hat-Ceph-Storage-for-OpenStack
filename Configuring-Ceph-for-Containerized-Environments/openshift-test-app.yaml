@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ceph-test-app
+  namespace: ceph-storage
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ceph-test-app
+  template:
+    metadata:
+      labels:
+        app: ceph-test-app
+    spec:
+      containers:
+      - name: test-app
+        image: registry.redhat.io/ubi8/ubi:latest
+        command: ["/bin/sh"]
+        args: ["-c", "while true; do echo $(date) >> /data/log.txt; sleep 30; done"]
+        volumeMounts:
+        - name: ceph-storage
+          mountPath: /data
+      volumes:
+      - name: ceph-storage
+        persistentVolumeClaim:
+          claimName: ceph-test-pvc

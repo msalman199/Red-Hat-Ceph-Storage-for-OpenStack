@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ceph-csi-config
+  namespace: ceph-storage
+data:
+  config.json: |
+    [
+      {
+        "clusterID": "",
+        "monitors": [""]
+      }
+    ]

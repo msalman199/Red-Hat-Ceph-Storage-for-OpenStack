@@ -1,0 +1,9 @@
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: postgres-snapshot
+  namespace: database-apps
+spec:
+  volumeSnapshotClassName: ceph-rbd-snapshot-class
+  source:
+    persistentVolumeClaimName: postgres-storage-postgres-0
