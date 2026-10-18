@@ -1,0 +1,428 @@
+Lab 16: Ceph Monitoring with Prometheus and Grafana
+Objectives
+By the end of this lab, you will be able to:
+
+Deploy Prometheus and Grafana as podman containers on a shared network so they can communicate by container name
+Enable and verify the Ceph Manager Prometheus module and confirm real metrics are being exported
+Configure Prometheus to scrape Ceph metrics using the actual hostname/IP of your lab's Ceph manager node
+Integrate Grafana with Prometheus as a data source and build a working Ceph health dashboard
+Create Prometheus alert rules for critical Ceph cluster events and verify they load correctly
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Ceph storage architecture (monitors, managers, OSDs, pools)
+Familiarity with Linux command line operations and editing YAML files
+A running Ceph cluster with the ceph CLI available (single-node or multi-node "cephadm" or "microceph" style cluster is sufficient; this lab does not assume 3 separate physical nodes)
+Podman installed and working (podman --version)
+curl and jq installed for verification steps
+Install the verification tools if they are missing:
+
+sudo dnf install -y curl jq || sudo apt-get install -y curl jq
+This lab does not assume Ceph is already correctly configured. Task 1 begins by verifying the cluster and discovering the correct manager address before touching Prometheus, so every hostname used later in the lab is one you confirmed yourself, not a placeholder.
+
+Task 1: Verify the Ceph Cluster and Expose Prometheus Metrics
+Subtask 1.1: Confirm the Ceph Cluster Is Healthy and Identify the Manager Address
+Step 1: Confirm the cluster responds and check its health
+
+sudo ceph -s
+You should see output with a cluster: block showing an id, and a health: line. If health is HEALTH_WARN, that is acceptable for this lab, but the command must succeed. If ceph -s fails with a connection error, your cluster is not running and must be started before continuing (this lab assumes the cluster itself is already installed and reachable).
+
+Step 2: Identify the exact host running the active manager
+
+sudo ceph mgr services
+This will currently be empty or show no prometheus key yet, which is expected. Instead, identify which host runs the active mgr daemon:
+
+sudo ceph mgr stat
+sudo ceph orch ps --daemon-type mgr 2>/dev/null || sudo ceph mgr dump | jq '.active_name, .active_addr'
+Step 3: Record the real IP address you will use for the rest of the lab
+
+MGR_ADDR=$(sudo ceph mgr dump | jq -r '.active_addr' | cut -d':' -f1 | cut -d'/' -f1)
+echo "Active manager address: $MGR_ADDR"
+If MGR_ADDR is blank or shows -, fall back to the machine's own IP, since in a single-node lab cluster the manager runs locally:
+
+if [ -z "$MGR_ADDR" ] || [ "$MGR_ADDR" = "-" ]; then
+  MGR_ADDR=$(hostname -I | awk '{print $1}')
+fi
+echo "Using MGR_ADDR=$MGR_ADDR"
+Deliverable: A recorded, working IP address in the MGR_ADDR shell variable that you confirmed responds to ceph -s. You will use this exact value in Prometheus configuration instead of guessing a hostname like ceph-mon1.
+
+Subtask 1.2: Enable and Verify the Ceph Prometheus Module
+Step 1: Enable the module and configure its bind address
+
+sudo ceph mgr module enable prometheus
+sudo ceph config set mgr mgr/prometheus/server_port 9283
+sudo ceph config set mgr mgr/prometheus/server_addr 0.0.0.0
+sudo ceph config set mgr mgr/prometheus/cache true
+Step 2: Confirm the module registered its URL
+
+sudo ceph mgr services
+Expected output now includes a prometheus key, for example:
+
+{
+    "prometheus": "http://0.0.0.0:9283/"
+}
+Step 3: Test the metrics endpoint directly on the host, using the address you recorded
+
+curl -s "http://${MGR_ADDR}:9283/metrics" | head -20
+Expected result: plain-text Prometheus metric lines beginning with # HELP and # TYPE, followed by lines such as ceph_health_status 0 or ceph_health_status 1. If this curl fails or returns nothing, the module is not bound correctly; re-run Step 1 and check sudo ceph mgr module ls to confirm prometheus is listed under enabled_modules.
+
+Deliverable: Raw Ceph metrics visible via curl on ${MGR_ADDR}:9283/metrics, confirming the data source Prometheus will scrape actually exists before you configure Prometheus itself.
+
+Task 2: Deploy Prometheus and Grafana on a Shared Podman Network
+Subtask 2.1: Create a Dedicated Podman Network and Directory Structure
+Containers on the default podman bridge cannot resolve each other by name unless they share an explicit user-defined network. This subtask creates that network first, so prometheus and grafana can reach each other by container name later.
+
+Step 1: Create the shared network
+
+sudo podman network create ceph-monitoring-net
+sudo podman network inspect ceph-monitoring-net | jq '.[0].name, .[0].subnets'
+Expected result: a JSON object confirming the network ceph-monitoring-net exists with an assigned subnet.
+
+Step 2: Create the directory structure for configuration and data
+
+sudo mkdir -p /opt/monitoring/{prometheus,grafana,alertmanager}
+sudo mkdir -p /opt/monitoring/prometheus/{data,config}
+sudo mkdir -p /opt/monitoring/grafana/{data,dashboards}
+sudo mkdir -p /opt/monitoring/grafana/provisioning/{datasources,dashboards}
+sudo chown -R $USER:$USER /opt/monitoring
+Deliverable: podman network ls shows ceph-monitoring-net, and ls /opt/monitoring shows the prometheus, grafana, and alertmanager directories.
+
+Subtask 2.2: Configure and Start Prometheus on the Shared Network
+Step 1: Write the Prometheus configuration using the real manager address from Task 1
+
+cat > /opt/monitoring/prometheus/config/prometheus.yml << EOF
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "/etc/prometheus/ceph_alerts.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'ceph-mgr'
+    static_configs:
+      - targets: ['${MGR_ADDR}:9283']
+    scrape_interval: 5s
+    metrics_path: /metrics
+EOF
+Note that this file uses ${MGR_ADDR}, expanded at write time from the variable you confirmed in Task 1, rather than an assumed hostname such as ceph-mon1. Confirm the substitution worked:
+
+grep -A2 "ceph-mgr" /opt/monitoring/prometheus/config/prometheus.yml
+Expected result: the targets line shows a real dotted-quad IP address, not a literal ${MGR_ADDR} string.
+
+Step 2: Copy the alert rules placeholder now so the container mount does not fail (populated fully in Task 3)
+
+cat > /opt/monitoring/prometheus/config/ceph_alerts.yml << 'EOF'
+groups:
+- name: placeholder
+  rules: []
+EOF
+Step 3: Start the Prometheus container attached to the shared network
+
+sudo podman run -d \
+  --name prometheus \
+  --network ceph-monitoring-net \
+  --restart unless-stopped \
+  -p 9090:9090 \
+  -v /opt/monitoring/prometheus/config:/etc/prometheus:Z \
+  -v /opt/monitoring/prometheus/data:/prometheus:Z \
+  --user root \
+  prom/prometheus:latest \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/prometheus \
+  --web.console.libraries=/etc/prometheus/console_libraries \
+  --web.console.templates=/etc/prometheus/consoles \
+  --storage.tsdb.retention.time=30d \
+  --web.enable-lifecycle
+Step 4: Confirm the container is attached to the network and is scraping successfully
+
+sudo podman inspect prometheus | jq '.[0].NetworkSettings.Networks | keys'
+sleep 10
+curl -s "http://localhost:9090/api/v1/targets" | jq '.data.activeTargets[] | {job: .labels.job, health: .health}'
+Expected result: the network keys list includes ceph-monitoring-net, and the ceph-mgr job shows "health": "up". If it shows "down", verify ${MGR_ADDR} is reachable from inside the container:
+
+sudo podman exec prometheus wget -qO- "http://${MGR_ADDR}:9283/metrics" | head -5
+Deliverable: http://localhost:9090/api/v1/targets reports the ceph-mgr job as up, proving Prometheus is successfully scraping live Ceph metrics from the address you verified in Task 1.
+
+Subtask 2.3: Configure and Start Grafana on the Same Network
+Because Grafana will reference Prometheus by container name (http://prometheus:9090), it must join the same podman network created in Subtask 2.1. Without this, name resolution between containers fails even though both expose ports to the host.
+
+Step 1: Create the Grafana datasource provisioning file
+
+cat > /opt/monitoring/grafana/provisioning/datasources/prometheus.yml << 'EOF'
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: "5s"
+EOF
+Step 2: Create the dashboard provisioning configuration
+
+cat > /opt/monitoring/grafana/provisioning/dashboards/dashboard.yml << 'EOF'
+apiVersion: 1
+
+providers:
+  - name: 'Ceph Dashboards'
+    orgId: 1
+    folder: 'Ceph'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+EOF
+Step 3: Start the Grafana container on the shared network
+
+sudo podman run -d \
+  --name grafana \
+  --network ceph-monitoring-net \
+  --restart unless-stopped \
+  -p 3000:3000 \
+  -v /opt/monitoring/grafana/data:/var/lib/grafana:Z \
+  -v /opt/monitoring/grafana/provisioning:/etc/grafana/provisioning:Z \
+  -v /opt/monitoring/grafana/dashboards:/var/lib/grafana/dashboards:Z \
+  --user root \
+  -e "GF_SECURITY_ADMIN_PASSWORD=admin123" \
+  -e "GF_USERS_ALLOW_SIGN_UP=false" \
+  grafana/grafana:latest
+Step 4: Confirm Grafana can resolve and reach Prometheus by container name
+
+sleep 20
+curl -s http://localhost:3000/api/health
+sudo podman exec grafana wget -qO- http://prometheus:9090/-/healthy
+Expected result: the first command returns JSON containing "database": "ok", and the second command returns the text Prometheus Server is Healthy. printed from inside the Grafana container, proving container-name-based communication is working.
+
+Step 5: Verify the Prometheus datasource is active inside Grafana
+
+curl -s -u admin:admin123 http://localhost:3000/api/datasources | jq '.[] | {name, url, type}'
+Expected result: a JSON object showing "name": "Prometheus", "url": "http://prometheus:9090", "type": "prometheus".
+
+Deliverable: podman exec grafana wget -qO- http://prometheus:9090/-/healthy succeeds, and the Grafana datasources API confirms the Prometheus datasource is registered and reachable by hostname, not just by host-mapped port.
+
+Subtask 2.4: Build a Ceph Cluster Overview Dashboard
+Step 1: Create the dashboard JSON file
+
+cat > /opt/monitoring/grafana/dashboards/ceph-cluster-overview.json << 'EOF'
+{
+  "dashboard": {
+    "id": null,
+    "title": "Ceph Cluster Overview",
+    "tags": ["ceph", "storage"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Cluster Health Status",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "ceph_health_status",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [
+              {
+                "options": {
+                  "0": { "text": "HEALTH_OK", "color": "green" },
+                  "1": { "text": "HEALTH_WARN", "color": "yellow" },
+                  "2": { "text": "HEALTH_ERR", "color": "red" }
+                },
+                "type": "value"
+              }
+            ]
+          }
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 }
+      },
+      {
+        "id": 2,
+        "title": "Total Cluster Capacity",
+        "type": "stat",
+        "targets": [
+          { "expr": "ceph_cluster_total_bytes", "refId": "A" }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "bytes" }
+        },
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 }
+      },
+      {
+        "id": 3,
+        "title": "OSD Up Count",
+        "type": "stat",
+        "targets": [
+          { "expr": "sum(ceph_osd_up)", "refId": "A" }
+        ],
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 }
+      },
+      {
+        "id": 4,
+        "title": "OSD In Count",
+        "type": "stat",
+        "targets": [
+          { "expr": "sum(ceph_osd_in)", "refId": "A" }
+        ],
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 }
+      }
+    ],
+    "time": { "from": "now-1h", "to": "now" },
+    "refresh": "5s"
+  }
+}
+EOF
+Step 2: Restart Grafana so provisioning picks up the new dashboard file
+
+sudo podman restart grafana
+sleep 15
+Step 3: Verify the dashboard was provisioned
+
+curl -s -u admin:admin123 "http://localhost:3000/api/search?query=Ceph%20Cluster%20Overview" | jq '.[] | {title, uid, folderTitle}'
+Expected result: a JSON entry with "title": "Ceph Cluster Overview". Open a browser to http://<your-lab-host>:3000, log in with admin / admin123, and confirm the "Ceph" folder contains the "Ceph Cluster Overview" dashboard showing a live health status panel.
+
+Deliverable: A Grafana dashboard visible in the UI displaying real-time ceph_health_status, ceph_cluster_total_bytes, and OSD count panels, sourced from your live Ceph cluster through the shared podman network.
+
+Task 3: Create and Verify Ceph Alert Rules in Prometheus
+Subtask 3.1: Write Ceph-Specific Alert Rules
+Step 1: Replace the placeholder alert rules with real Ceph alerting rules
+
+cat > /opt/monitoring/prometheus/config/ceph_alerts.yml << 'EOF'
+groups:
+- name: ceph-cluster-alerts
+  rules:
+  - alert: CephClusterErrorState
+    expr: ceph_health_status == 2
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Ceph cluster is in ERROR state"
+      description: "Ceph cluster health has been HEALTH_ERR for more than 5 minutes."
+
+  - alert: CephClusterWarningState
+    expr: ceph_health_status == 1
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Ceph cluster is in WARNING state"
+      description: "Ceph cluster health has been HEALTH_WARN for more than 10 minutes."
+
+  - alert: CephOSDDown
+    expr: ceph_osd_up == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Ceph OSD {{ $labels.ceph_daemon }} is down"
+      description: "OSD {{ $labels.ceph_daemon }} has been down for more than 1 minute."
+
+- name: ceph-capacity-alerts
+  rules:
+  - alert: CephClusterNearFull
+    expr: (ceph_cluster_total_used_bytes / ceph_cluster_total_bytes) * 100 > 80
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Ceph cluster is nearly full"
+      description: "Ceph cluster storage usage is {{ $value }}%."
+
+  - alert: CephClusterFull
+    expr: (ceph_cluster_total_used_bytes / ceph_cluster_total_bytes) * 100 > 90
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Ceph cluster is critically full"
+      description: "Ceph cluster storage usage is {{ $value }}%. Immediate expansion required."
+EOF
+Step 2: Reload Prometheus configuration without restarting the container
+
+curl -X POST http://localhost:9090/-/reload
+Deliverable: The curl -X POST command returns no error (empty response, HTTP 200).
+
+Subtask 3.2: Verify the Alert Rules Loaded Correctly
+Step 1: Confirm the rule groups are recognized by Prometheus
+
+curl -s http://localhost:9090/api/v1/rules | jq '.data.groups[].name'
+Expected result:
+
+"ceph-cluster-alerts"
+"ceph-capacity-alerts"
+Step 2: Check the current evaluation state of each rule
+
+curl -s http://localhost:9090/api/v1/rules | jq '.data.groups[].rules[] | {alert: .name, state: .state, health: .health}'
+Expected result: each rule shows "health": "ok" and a "state" of either "inactive" (condition not currently true) or "pending"/"firing" if the condition is met. A "health": "err" value indicates a broken PromQL expression that must be fixed before continuing.
+
+Step 3: Query the live health metric directly to confirm the alert data source is correct
+
+curl -s "http://localhost:9090/api/v1/query?query=ceph_health_status" | jq
+Expected result: a JSON object with "status": "success" and a "result" array containing the current value of ceph_health_status (0, 1, or 2) with an instance label matching ${MGR_ADDR}:9283.
+
+Deliverable: Both alert rule groups appear with "health": "ok", and the ceph_health_status query returns a real value from your cluster, confirming the full pipeline from Ceph mgr through Prometheus scraping to alert rule evaluation is working end to end.
+
+Verification and Testing
+Run this final combined check to confirm every component of the stack is working together:
+
+echo "Checking service status..."
+echo "=========================="
+
+if curl -s "http://localhost:9090/api/v1/query?query=up" | grep -q '"status":"success"'; then
+    echo "OK: Prometheus is running and accessible"
+else
+    echo "FAIL: Prometheus is not responding"
+fi
+
+if curl -s http://localhost:3000/api/health | grep -q '"database":"ok"'; then
+    echo "OK: Grafana is running and accessible"
+else
+    echo "FAIL: Grafana is not responding"
+fi
+
+if sudo podman exec grafana wget -qO- http://prometheus:9090/-/healthy | grep -q "Healthy"; then
+    echo "OK: Grafana can reach Prometheus over the shared network"
+else
+    echo "FAIL: Grafana cannot reach Prometheus by container name"
+fi
+
+if curl -s "http://${MGR_ADDR}:9283/metrics" | grep -q "ceph_"; then
+    echo "OK: Ceph metrics are being exported"
+else
+    echo "FAIL: Ceph metrics are not available"
+fi
+
+if curl -s "http://localhost:9090/api/v1/query?query=ceph_health_status" | jq -e '.data.result | length > 0' > /dev/null; then
+    echo "OK: Prometheus has ceph_health_status data"
+else
+    echo "FAIL: Prometheus has no ceph_health_status data"
+fi
+Expected result: all five lines print OK:. If any line prints FAIL:, revisit the corresponding subtask: Prometheus failures point back to Subtask 2.2, Grafana failures point back to Subtask 2.3, and Ceph metrics failures point back to Subtask 1.2.
+
+Expected Outcomes
+A working Prometheus and Grafana stack running as podman containers on a shared user-defined network, with verified container-to-container name resolution
+A live Grafana dashboard displaying real Ceph cluster health, capacity, and OSD status pulled directly from your cluster's mgr Prometheus module
+A set of loaded and evaluated Prometheus alert rules covering cluster health state, OSD availability, and storage capacity thresholds
+Troubleshooting
+If podman exec grafana wget -qO- http://prometheus:9090/-/healthy fails but both containers show as running, inspect podman network ls and podman inspect <container> | jq '.[0].NetworkSettings.Networks' for both containers: what differs between them, and what does that tell you about how container DNS resolution is scoped in podman?
+If the ceph-mgr target in Prometheus shows "health": "down" even though curl http://${MGR_ADDR}:9283/metrics works from the host, what is different about network reachability from inside a container versus from the host itself, and what commands could you run inside the Prometheus container to isolate whether this is a DNS, routing, or firewall problem?
+Conclusion
+In this lab you built a complete Ceph monitoring pipeline from the ground up: you first verified the Ceph cluster's health and discovered its real manager address rather than assuming a hostname, then enabled and confirmed the native Prometheus metrics endpoint, deployed Prometheus and Grafana as podman containers joined to a shared user-defined network so they could resolve each other by name, and finally authored and verified Prometheus alert rules covering cluster health, OSD availability, and capacity thresholds. Along the way you learned to read and interpret key Ceph metrics such as ceph_health_status, ceph_osd_up, and ceph_cluster_total_used_bytes, and how to verify each layer of the stack independently rather than assuming success. For production environments, this same pattern should be extended with persistent storage volumes for Prometheus and Grafana data, TLS between components, a real Alertmanager receiver such as PagerDuty or Slack instead of a local webhook, and multi-node scrape targets for every mgr, mon, and OSD host in the cluster. From here, natural next steps include exploring Ceph's built-in Grafana dashboard bundle shipped with cephadm, adding recording rules to reduce query load on large clusters, and integrating long-term metrics storage such as Thanos or Cortex for multi-cluster visibility.
